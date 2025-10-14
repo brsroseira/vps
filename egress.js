@@ -43,4 +43,33 @@ app.get("/proxy", async (req,res)=>{
   let url=String(src);
   for(let hops=0;hops<8;hops++){
     let up;
-    try{ up=await request(url,{method:"GET",headers:makeHeaders(url),maxRedirections:0,headersTimeout:0,bodyTimeout:
+    try{ up=await request(url,{method:"GET",headers:makeHeaders(url),maxRedirections:0,headersTimeout:0,bodyTimeout:0}); }
+    catch(e){ const msg=String(e?.code||e?.message||e);
+      if(/ECONNRESET|EPIPE|ETIMEDOUT|UND_ERR_SOCKET|Premature close/i.test(msg)){ await new Promise(r=>setTimeout(r,150)); continue; }
+      return res.status(502).send("upstream error");
+    }
+    const sc=up.statusCode, loc=up.headers.location;
+    if(sc>=300&&sc<400&&loc){ try{up.body.destroy();}catch{} url=new URL(loc,url).toString(); continue; }
+
+    res.status(sc);
+    const pass=new Set(["content-type","content-length","accept-ranges","content-range","cache-control","etag","last-modified"]);
+    for(const [k,v] of Object.entries(up.headers||{})) if(pass.has(String(k).toLowerCase())&&v!=null) res.setHeader(k,v);
+    res.setHeader("Access-Control-Allow-Origin","*");
+    res.setHeader("Access-Control-Expose-Headers","Content-Range, Accept-Ranges, Content-Length");
+    res.setHeader("Accept-Ranges","bytes");
+    res.setHeader("Content-Disposition","inline");
+    res.setHeader("X-Content-Type-Options","nosniff");
+    let ct=String(up.headers["content-type"]||"").toLowerCase();
+    if(!ct||ct.includes("octet-stream")||ct.includes("application/force-download")) res.setHeader("Content-Type",guessMime(url));
+    if(!("content-range" in up.headers)) res.removeHeader("Content-Length");
+
+    req.on("aborted",()=>{try{up.body.destroy();}catch{}});
+    res.on("close",  ()=>{try{up.body.destroy();}catch{}});
+    res.on("error",  ()=>{try{up.body.destroy();}catch{}});
+    await pump(up.body,res); return;
+  }
+  res.status(508).send("too many redirects");
+});
+
+const PORT=Number(process.env.PORT||8080);
+app.listen(PORT,()=>console.log("EGRESS listening on",PORT));
