@@ -1,4 +1,4 @@
-// egress.js — proxy resiliente (Node 20/22 + Undici)
+// egress.js — proxy resiliente p/ Fly.io (Node 20/22 + Undici)
 const express = require("express");
 const { request } = require("undici");
 const app = express();
@@ -17,15 +17,21 @@ function hostAllowed(u){
   try{ return allow.includes(new URL(u).hostname) }catch{ return false }
 }
 
-// fecha stream sem propagar erro do Undici
-function destroyQuiet(up, label="destroy"){
+function swallow(stream){
+  if (!stream) return;
+  try {
+    // evita “Unhandled 'error' event”
+    stream.on?.('error', ()=>{});
+  } catch {}
+}
+async function closeQuiet(up,label){
   try{
     const s = up && up.body;
     if (!s) return;
-    // garanta que não estoure 'error' não tratado
-    s.off?.("error", ()=>{});
-    s.on?.("error", ()=>{});
-    if (!s.destroyed) s.destroy();
+    swallow(s);
+    // tente cancelar (undici) e, por via das dúvidas, destruir
+    if (typeof s.cancel === "function") { try{ await s.cancel(); }catch{} }
+    if (!s.destroyed && typeof s.destroy === "function") s.destroy();
   }catch{}
 }
 
@@ -48,18 +54,20 @@ async function fetchFollow(startUrl, req, max=8){
 
     try{
       const up = await request(url, { method:"GET", headers, maxRedirections:0, bodyTimeout:0, headersTimeout:0 });
+      // 👉 prenda o erro IMEDIATAMENTE
+      swallow(up.body);
+
       const sc  = up.statusCode;
       const loc = up.headers.location;
 
       if (sc>=300 && sc<400 && loc && hops<max){
-        destroyQuiet(up, "redirect");
+        await closeQuiet(up, "redirect");
         url = new URL(loc, url).toString();
         continue;
       }
       return { up, finalUrl:url };
     }catch(e){
       const msg = String(e.code||e.message||e);
-      // pequenos retries em erros de rede/encerramento precoce
       if (/Premature close|UND_ERR_(SOCKET|ABORTED)|ECONNRESET|EPIPE|ETIMEDOUT/i.test(msg) && hops<max){
         await new Promise(r=>setTimeout(r,150));
         continue;
@@ -95,10 +103,10 @@ async function proxyHandler(req,res){
     }
     if (!("content-range" in up.headers)) res.removeHeader("Content-Length");
 
-    // evitar quedas do processo
+    // handlers para garantir que o processo nunca caia
     up.body.on("error", ()=>{ try{ res.destroy(); }catch{} });
-    res.on("close", ()=>destroyQuiet(up,"res close"));
-    res.on("error", ()=>destroyQuiet(up,"res error"));
+    res.on("close", ()=>closeQuiet(up,"res close"));
+    res.on("error", ()=>closeQuiet(up,"res error"));
 
     up.body.pipe(res);
   }catch(e){
