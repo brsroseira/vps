@@ -1,6 +1,10 @@
 // egress.js — proxy resiliente p/ Fly.io (Node 20/22 + Undici)
 const express = require("express");
 const { request } = require("undici");
+const { pipeline } = require("node:stream");
+const { promisify } = require("node:util");
+const pump = promisify(pipeline);
+
 const app = express();
 
 app.get("/health", (req,res)=>res.json({ok:true}));
@@ -17,22 +21,13 @@ function hostAllowed(u){
   try{ return allow.includes(new URL(u).hostname) }catch{ return false }
 }
 
-function swallow(stream){
-  if (!stream) return;
-  try {
-    // evita “Unhandled 'error' event”
-    stream.on?.('error', ()=>{});
-  } catch {}
-}
-async function closeQuiet(up,label){
-  try{
-    const s = up && up.body;
-    if (!s) return;
-    swallow(s);
-    // tente cancelar (undici) e, por via das dúvidas, destruir
-    if (typeof s.cancel === "function") { try{ await s.cancel(); }catch{} }
-    if (!s.destroyed && typeof s.destroy === "function") s.destroy();
-  }catch{}
+// prende erro e tenta cancelar sem derrubar o processo
+async function safeClose(up, label="close"){
+  if (!up || !up.body) return;
+  const b = up.body;
+  try { b.on?.("error", ()=>{}); } catch {}
+  try { if (typeof b.cancel === "function") await b.cancel(); } catch {}
+  console.log("[egress]", label);
 }
 
 async function fetchFollow(startUrl, req, max=8){
@@ -54,14 +49,14 @@ async function fetchFollow(startUrl, req, max=8){
 
     try{
       const up = await request(url, { method:"GET", headers, maxRedirections:0, bodyTimeout:0, headersTimeout:0 });
-      // 👉 prenda o erro IMEDIATAMENTE
-      swallow(up.body);
+      // prenda o erro IMEDIATAMENTE
+      up.body?.on?.("error", ()=>{});
 
       const sc  = up.statusCode;
       const loc = up.headers.location;
 
       if (sc>=300 && sc<400 && loc && hops<max){
-        await closeQuiet(up, "redirect");
+        await safeClose(up, "redirect");
         url = new URL(loc, url).toString();
         continue;
       }
@@ -103,12 +98,13 @@ async function proxyHandler(req,res){
     }
     if (!("content-range" in up.headers)) res.removeHeader("Content-Length");
 
-    // handlers para garantir que o processo nunca caia
+    // proteção extra no stream
     up.body.on("error", ()=>{ try{ res.destroy(); }catch{} });
-    res.on("close", ()=>closeQuiet(up,"res close"));
-    res.on("error", ()=>closeQuiet(up,"res error"));
+    req.on("aborted", ()=>safeClose(up,"client aborted"));
+    res.on("close",  ()=>safeClose(up,"res close"));
+    res.on("error",  ()=>safeClose(up,"res error"));
 
-    up.body.pipe(res);
+    await pump(up.body, res).catch(()=>{});
   }catch(e){
     console.error("proxy error:", e.code||e.message||e);
     if (!res.headersSent) res.status(502).send("proxy error");
