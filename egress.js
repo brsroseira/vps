@@ -1,101 +1,113 @@
-// egress.js — egress/proxy mínimo com logs
+// egress.js — proxy resiliente (Node 20/22 + Undici)
 const express = require("express");
 const { request } = require("undici");
 const app = express();
 
-app.use((req,res,next)=>{
-  console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`);
-  next();
+app.get("/health", (req,res)=>res.json({ok:true}));
+app.get("/", (req,res)=>{
+  if (req.query && req.query.u) return proxyHandler(req,res);
+  res.type("text/plain").send("egress up\nroutes: GET /health, GET /proxy?u=...");
 });
 
-app.get("/health", (req,res)=> res.json({ok:true}));
-
-function isHttpUrl(v){
-  try{ const u=new URL(String(v)); return u.protocol==="http:"||u.protocol==="https:"; }
-  catch{ return false; }
-}
-function guessMime(u=""){
-  const p=String(u).toLowerCase();
-  if(p.endsWith(".mp4")) return "video/mp4";
-  if(p.endsWith(".m3u8")) return "application/vnd.apple.mpegurl";
-  if(p.endsWith(".ts")) return "video/mp2t";
-  if(p.endsWith(".mkv")) return "video/x-matroska";
-  return "application/octet-stream";
-}
-function hostAllowed(url){
-  const allow = (process.env.ALLOW_HOSTS||"").split(",").map(s=>s.trim()).filter(Boolean);
-  if(allow.length===0) return true;
-  try{ const h=new URL(url).hostname; return allow.includes(h); } catch{ return false; }
+function isHttpUrl(v){ try{ const u=new URL(String(v)); return u.protocol==="http:"||u.protocol==="https:" }catch{ return false } }
+function wantsRange(u){ return /\.(mp4|mkv|ts)(\?|$)/i.test(String(u||"")) }
+function hostAllowed(u){
+  const allow=(process.env.ALLOW_HOSTS||"").split(",").map(s=>s.trim()).filter(Boolean);
+  if(!allow.length) return true;
+  try{ return allow.includes(new URL(u).hostname) }catch{ return false }
 }
 
-// follow simples + headers esperados pelo origin
+// fecha stream sem propagar erro do Undici
+function destroyQuiet(up, label="destroy"){
+  try{
+    const s = up && up.body;
+    if (!s) return;
+    // garanta que não estoure 'error' não tratado
+    s.off?.("error", ()=>{});
+    s.on?.("error", ()=>{});
+    if (!s.destroyed) s.destroy();
+  }catch{}
+}
+
 async function fetchFollow(startUrl, req, max=8){
   let url = String(startUrl);
-  for(let hops=0; hops<=max; hops++){
+  for (let hops=0; hops<=max; hops++){
     const u = new URL(url);
-    const q = req.query||{};
+    const q = req.query || {};
     const headers = {
       "User-Agent": q.ua || req.get("user-agent") || "Mozilla/5.0",
       "Accept": "*/*",
       "Accept-Encoding": "identity",
-      ...(req.get("range") ? { Range: req.get("range") } : {}),
+      ...(req.get("range") ? { Range: req.get("range") } : wantsRange(url) ? { Range: "bytes=0-" } : {}),
       "Referer": q.r || (u.origin + "/"),
       "Origin": (q.r ? new URL(q.r).origin : u.origin),
-      "Connection": "keep-alive",
-      "Accept-Language": "en-US,en;q=0.9,pt-BR;q=0.8",
-      "Host": u.host
+      "Host": u.host,
+      "Connection": "close",
+      "Accept-Language": "en-US,en;q=0.9,pt-BR;q=0.8"
     };
-    const up = await request(url, { method:"GET", headers, maxRedirections:0 });
-    const sc = up.statusCode, loc = up.headers.location;
-    if(sc>=300 && sc<400 && loc && hops<max){
-      up.body?.destroy?.();
-      url = new URL(loc, url).toString();
-      continue;
+
+    try{
+      const up = await request(url, { method:"GET", headers, maxRedirections:0, bodyTimeout:0, headersTimeout:0 });
+      const sc  = up.statusCode;
+      const loc = up.headers.location;
+
+      if (sc>=300 && sc<400 && loc && hops<max){
+        destroyQuiet(up, "redirect");
+        url = new URL(loc, url).toString();
+        continue;
+      }
+      return { up, finalUrl:url };
+    }catch(e){
+      const msg = String(e.code||e.message||e);
+      // pequenos retries em erros de rede/encerramento precoce
+      if (/Premature close|UND_ERR_(SOCKET|ABORTED)|ECONNRESET|EPIPE|ETIMEDOUT/i.test(msg) && hops<max){
+        await new Promise(r=>setTimeout(r,150));
+        continue;
+      }
+      throw e;
     }
-    return { up, finalUrl: url };
   }
-  throw new Error("too many redirects");
+  throw new Error("too many redirects/retries");
 }
 
-// === A ROTA QUE INTERESSA ===
-app.get("/proxy", async (req,res)=>{
+async function proxyHandler(req,res){
   const u = req.query.u;
-  if(!u || !isHttpUrl(u)) return res.status(400).send("bad url");
-  if(!hostAllowed(u)) return res.status(403).send("forbidden host");
+  if (!u || !isHttpUrl(u)) return res.status(400).send("bad url");
+  if (!hostAllowed(u))     return res.status(403).send("forbidden host");
 
   try{
     const { up, finalUrl } = await fetchFollow(u, req);
-
     res.status(up.statusCode);
 
-    const pass = new Set(["content-type","content-length","accept-ranges","content-range","cache-control","etag","last-modified"]);
-    for(const [k,v] of Object.entries(up.headers||{})){
-      if(pass.has(String(k).toLowerCase()) && v!=null) res.setHeader(k, v);
-    }
-    res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Access-Control-Expose-Headers", "Content-Range, Accept-Ranges, Content-Length");
-    res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
-    res.setHeader("Accept-Ranges", "bytes");
-    res.setHeader("Content-Disposition", "inline");
-    res.setHeader("X-Content-Type-Options", "nosniff");
+    const pass=new Set(["content-type","content-length","accept-ranges","content-range","cache-control","etag","last-modified"]);
+    for (const [k,v] of Object.entries(up.headers||{})) if (pass.has(String(k).toLowerCase()) && v!=null) res.setHeader(k,v);
 
-    let ct = String(up.headers["content-type"]||"").toLowerCase();
-    if(!ct || ct.includes("octet-stream") || ct.includes("application/force-download")){
-      ct = guessMime(finalUrl);
-      res.setHeader("Content-Type", ct);
+    res.setHeader("Access-Control-Allow-Origin","*");
+    res.setHeader("Access-Control-Expose-Headers","Content-Range, Accept-Ranges, Content-Length");
+    res.setHeader("Cross-Origin-Resource-Policy","cross-origin");
+    res.setHeader("Accept-Ranges","bytes");
+    res.setHeader("Content-Disposition","inline");
+    res.setHeader("X-Content-Type-Options","nosniff");
+
+    let ct=String(up.headers["content-type"]||"").toLowerCase();
+    if (!ct || ct.includes("octet-stream") || ct.includes("application/force-download")){
+      if (finalUrl.toLowerCase().endsWith(".ts")) res.setHeader("Content-Type","video/mp2t");
     }
-    if(!("content-range" in up.headers)) res.removeHeader("Content-Length");
+    if (!("content-range" in up.headers)) res.removeHeader("Content-Length");
+
+    // evitar quedas do processo
+    up.body.on("error", ()=>{ try{ res.destroy(); }catch{} });
+    res.on("close", ()=>destroyQuiet(up,"res close"));
+    res.on("error", ()=>destroyQuiet(up,"res error"));
 
     up.body.pipe(res);
-    up.body.on("error", ()=>res.destroy());
   }catch(e){
-    console.error("proxy error:", e?.code||e?.message||e);
-    if(!res.headersSent) res.status(502).send("proxy error");
+    console.error("proxy error:", e.code||e.message||e);
+    if (!res.headersSent) res.status(502).send("proxy error");
   }
-});
+}
 
-// root p/ confirmar que é este app
-app.get("/", (req,res)=> res.type("text/plain").send("egress up\nroutes: GET /health, GET /proxy?u=..."));
+app.get("/proxy", proxyHandler);
 
 const PORT = Number(process.env.PORT||8080);
-app.listen(PORT, ()=> console.log("EGRESS listening on", PORT));
+app.listen(PORT, ()=>console.log("EGRESS listening on", PORT));
